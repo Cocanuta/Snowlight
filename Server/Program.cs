@@ -31,6 +31,9 @@ using Snowlight.Game.Recycler;
 using Snowlight.Game.Pets;
 using Snowlight.Game.Music;
 using Snowlight.Game.Rooms.Trading;
+using Snowlight.Game.Misc.Chat;
+using Snowlight.Game.Items.DefaultBehaviorHandlers;
+using Snowlight.Game.Items.Wired;
 
 
 namespace Snowlight
@@ -39,6 +42,7 @@ namespace Snowlight
     {
         private static bool mAlive;
         private static SnowTcpListener mServer;
+        private static SnowTcpListener musServer;
 
         /// <summary>
         /// Should be used by all non-worker threads to check if they should remain alive, allowing for safe termination.
@@ -51,20 +55,33 @@ namespace Snowlight
             }
         }
 
+        public static bool DEBUG
+        {
+            get
+            {
+                return true;
+            }
+        }
+
+
+
+
+
         [SecurityPermission(SecurityAction.Demand, Flags = SecurityPermissionFlag.ControlAppDomain)]
         public static void Main(string[] args)
         {
             mAlive = true;
             DateTime InitStart = DateTime.Now;
 
-            // Set up basic output
-            Output.InitializeStream(true, OutputLevel.DebugInformation);
-            Output.WriteLine("Initializing Snowlight..."); // Cannot be localized before config+lang is loaded
+            // Set up basic output            
+            Console.WriteLine("Initializing Snowlight..."); // Cannot be localized before config+lang is loaded
 
             // Load configuration, translation, and re-configure output from config data
-            ConfigManager.Initialize(Constants.DataFileDirectory + "\\server-main.cfg");
-            Output.SetVerbosityLevel((OutputLevel)ConfigManager.GetValue("output.verbositylevel"));
-            Localization.Initialize(Constants.LangFileDirectory + "\\lang_" + ConfigManager.GetValue("lang") + ".lang");
+            ConfigManager.Initialize(Constants.DataFileDirectory + "server-main.cfg");
+			Output.InitializeStream(true, (OutputLevel)ConfigManager.GetValue("output.verbositylevel"));
+			Output.WriteLine("Initializing Snowlight...");
+			
+            Localization.Initialize(Constants.LangFileDirectory  + "lang_" + ConfigManager.GetValue("lang") + ".lang");
 
             // Process args
             foreach (string arg in args)
@@ -81,9 +98,14 @@ namespace Snowlight
 
                 // Initialize network components
                 Output.WriteLine(Localization.GetValue("core.init.net", ConfigManager.GetValue("net.bind.port").ToString()));
-                mServer = new SnowTcpListener(new IPEndPoint(IPAddress.Any, (int)ConfigManager.GetValue("net.bind.port")),
+                mServer = new SnowTcpListener(new IPEndPoint((IPAddress)ConfigManager.GetValue("net.bind.ip"), (int)ConfigManager.GetValue("net.bind.port")),
                     (int)ConfigManager.GetValue("net.backlog"), new OnNewConnectionCallback(
                         SessionManager.HandleIncomingConnection));
+
+                Output.WriteLine(Localization.GetValue("core.init.net", ConfigManager.GetValue("net.cmd.bind.port").ToString()));
+                musServer = new SnowTcpListener(new IPEndPoint((IPAddress)ConfigManager.GetValue("net.cmd.bind.ip"), (int)ConfigManager.GetValue("net.cmd.bind.port")),
+                    (int)ConfigManager.GetValue("net.backlog"), new OnNewConnectionCallback(
+                        CommandListener.parse));
 
                 using (SqlDatabaseClient MySqlClient = SqlDatabaseManager.GetClient())
                 {
@@ -146,9 +168,11 @@ namespace Snowlight
                     TradeHandler.Initialize();
                     RandomGenerator.Initialize();
                     StatisticsSyncUtil.Initialize();
+                    Wordfilter.Initialize(MySqlClient);
 
                     // Polish
                     WarningSurpressors.Initialize();
+                    
                 }
             }
             catch (Exception e)
@@ -162,7 +186,8 @@ namespace Snowlight
 
             Output.WriteLine(Localization.GetValue("core.init.ok", Math.Round(TimeSpent.TotalSeconds, 2).ToString()), OutputLevel.Notification);
             Output.WriteLine((string)Localization.GetValue("core.init.ok.cmdinfo"), OutputLevel.Notification);
-
+			
+			Console.Write("$" + Environment.UserName.ToLower() + "@snowlight> ");
             Console.Beep();
             Input.Listen(); // This will make the main thread process console while Program.Alive.
         }
@@ -173,6 +198,10 @@ namespace Snowlight
             MySqlClient.SetParameter("timestamp", UnixTimestamp.GetCurrent());
             MySqlClient.ExecuteNonQuery("UPDATE room_visits SET timestamp_left = @timestamp WHERE timestamp_left = 0");
             MySqlClient.ExecuteNonQuery("UPDATE characters SET auth_ticket = ''");
+            MySqlClient.ExecuteNonQuery("UPDATE characters SET online = '0'");
+            MySqlClient.SetParameter("timestamp", UnixTimestamp.GetCurrent());
+            MySqlClient.ExecuteNonQuery("UPDATE server_statistics SET sval = @timestamp WHERE skey = 'stamp' LIMIT 1");
+            MySqlClient.ExecuteNonQuery("UPDATE server_statistics SET sval = '1' WHERE skey = 'online_state' LIMIT 1");
         }
 
         public static void HandleFatalError(string Message)
@@ -184,13 +213,16 @@ namespace Snowlight
 
             Stop();
         }
-
+    
         public static void Stop()
         {
             Output.WriteLine(Localization.GetValue("core.uninit"));
 
             mAlive = false; // Will destroy any threads looping for Program.Alive.
-
+            using (SqlDatabaseClient MySqlClient = SqlDatabaseManager.GetClient())
+            {
+                MySqlClient.ExecuteNonQuery("UPDATE server_statistics SET sval = '0' WHERE skey = 'online_state' LIMIT 1");
+            }
             SqlDatabaseManager.Uninitialize();
 
             mServer.Dispose();
